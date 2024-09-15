@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use playground_common::{
-    lock_exclusive, lock_shared, resolve_and_run_cmd, test_lock, unlock, RUSTUP_LOCK_FD,
+    lock_exclusive, lock_shared, resolve_and_run_cmd, test_lock, RUSTUP_LOCK_FD,
 };
 use tracing::info;
 
@@ -55,10 +55,10 @@ fn main() -> Result<ExitCode> {
 
         info!("{prefix}: CRITICAL SECTION");
 
-        if is_root {
-            info!("{prefix}: releasing lock");
-            unlock(&lock)?;
-        }
+        // if is_root {
+        //     info!("{prefix}: releasing lock");
+        //     unlock(&lock)?;
+        // }
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -74,10 +74,10 @@ fn main() -> Result<ExitCode> {
     // std::thread::sleep(std::time::Duration::from_secs(60));
     let code = resolve_and_run_cmd(&args)?.code().unwrap_or(0);
 
-    if is_root {
-        info!("{prefix}: releasing lock");
-        unlock(&lock)?;
-    }
+    // if is_root {
+    //     info!("{prefix}: releasing lock");
+    //     unlock(&lock)?;
+    // }
 
     Ok(ExitCode::from(code as u8))
 }
