@@ -63,10 +63,8 @@ fn main() -> Result<ExitCode> {
     }
 
     // Proxy mode
-    if is_root {
-        info!("{prefix}: acquiring read lock");
-        lock_shared(&lock)?;
-    }
+    info!("{prefix}: acquiring read lock");
+    lock_shared(&lock)?;
     env::set_var(RUSTUP_LOCK_FD, fd.to_string());
 
     info!("{prefix}: CRITICAL SECTION");
