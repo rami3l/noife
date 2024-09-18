@@ -5,6 +5,7 @@ use std::{
     fs::File,
     io,
     mem::MaybeUninit,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     os::fd::AsRawFd,
     process::{self, Command, ExitStatus},
 };
@@ -12,7 +13,14 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use tracing::{error, info};
 
-pub const RUSTUP_LOCK_FD: &str = "RUSTUP_LOCK_FD";
+pub const RUSTUP_LOCK_ID: &str = "RUSTUP_LOCK_ID";
+
+pub fn localhost(port: u16) -> [SocketAddr; 2] {
+    [
+        SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0)),
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
+    ]
+}
 
 pub fn lock_shared(file: &File) -> io::Result<()> {
     flock(file, libc::LOCK_SH)
@@ -112,12 +120,12 @@ pub fn run_command_for_dir<S: AsRef<OsStr> + Debug>(
 ) -> Result<ExitStatus> {
     #[cfg(unix)]
     fn exec(cmd: &mut Command) -> io::Result<ExitStatus> {
-        use std::os::unix::prelude::*;
-        Err(cmd.exec())
+        // use std::os::unix::prelude::*;
+        // Err(cmd.exec())
 
         // NOTE: Looks like we can no longer use `exec` anyway,
         // otherwise we might not be able to clean up.
-        // cmd.status()
+        cmd.status()
     }
 
     #[cfg(windows)]

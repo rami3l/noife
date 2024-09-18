@@ -8,8 +8,10 @@ fn main() -> Result<()> {
 
     info!("hello");
     let period = Duration::from_secs(3);
-    loop {
+    // TODO: Add proper handling for Ctrl-C so that the lock can be released properly.
+    for _ in 0..3 {
         info!("running");
         thread::sleep(period)
     }
+    Ok(())
 }
