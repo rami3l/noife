@@ -4,7 +4,7 @@ use std::{
     process::{self, ExitCode},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use playground_common::{localhost, resolve_and_run_cmd, resolve_cmd, RUSTUP_LOCK_ID};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -72,43 +72,53 @@ async fn main() -> Result<ExitCode> {
         port: LOCKER_PORT,
     };
 
-    // Rustup mode
-    if matches!(&args[..], [head, ..] if head == "toolchain") {
-        // if !is_root {
-        //     info!("{prefix}: releasing lock");
-        //     locker.unlock().await?;
-        // }
+    match &args[..] {
+        // Rustup mode
+        [head, ..] if head == "toolchain" => {
+            // if !is_root {
+            //     info!("{prefix}: releasing lock");
+            //     locker.unlock().await?;
+            // }
 
-        info!("{prefix}: acquiring write lock");
-        locker.write_lock().await?;
+            info!("{prefix}: acquiring write lock");
+            locker.write_lock().await?;
 
-        info!("{prefix}: CRITICAL SECTION");
+            info!("{prefix}: CRITICAL SECTION");
 
-        if is_root {
-            info!("{prefix}: releasing lock");
-            locker.unlock().await?;
-        } else {
-            info!("{prefix}: acquiring read lock");
-            locker.read_lock().await?;
+            if is_root {
+                info!("{prefix}: releasing lock");
+                locker.unlock().await?;
+            } else {
+                info!("{prefix}: acquiring read lock");
+                locker.read_lock().await?;
+            }
+            Ok(ExitCode::SUCCESS)
         }
-        return Ok(ExitCode::SUCCESS);
+        // Proxy mode
+        args @ [head, tail @ ..] => {
+            if is_root {
+                info!("{prefix}: acquiring read lock");
+                locker.read_lock().await?;
+            }
+
+            info!("{prefix}: CRITICAL SECTION");
+
+            // std::thread::sleep(std::time::Duration::from_secs(60));
+            let code = if is_root {
+                resolve_cmd(head)?.args(tail).status()?
+            } else {
+                resolve_and_run_cmd(args)?
+            }
+            .code()
+            .unwrap_or(0);
+
+            if is_root {
+                info!("{prefix}: releasing lock");
+                locker.unlock().await?;
+            }
+            Ok(ExitCode::from(code as u8))
+        }
+
+        [] => bail!("no subcommand provided"),
     }
-
-    // Proxy mode
-    if is_root {
-        info!("{prefix}: acquiring read lock");
-        locker.read_lock().await?;
-    }
-
-    info!("{prefix}: CRITICAL SECTION");
-
-    // std::thread::sleep(std::time::Duration::from_secs(60));
-    let code = resolve_and_run_cmd(&args)?.code().unwrap_or(0);
-
-    if is_root {
-        info!("{prefix}: releasing lock");
-        locker.unlock().await?;
-    }
-
-    Ok(ExitCode::from(code as u8))
 }
