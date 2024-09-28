@@ -87,7 +87,7 @@ async fn main() -> Result<ExitCode> {
 
             if is_root {
                 info!("{prefix}: releasing lock");
-                locker.unlock().await?;
+                _ = locker.unlock().await;
             } else {
                 info!("{prefix}: acquiring read lock");
                 locker.read_lock().await?;
@@ -114,7 +114,7 @@ async fn main() -> Result<ExitCode> {
 
             if is_root {
                 info!("{prefix}: releasing lock");
-                locker.unlock().await?;
+                _ = locker.unlock().await;
             }
             Ok(ExitCode::from(code as u8))
         }

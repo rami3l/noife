@@ -8,7 +8,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     select,
-    sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock},
+    sync::{watch, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock},
     time,
 };
 use tokio_util::sync::CancellationToken;
@@ -16,10 +16,11 @@ use tracing::info;
 
 type LockId = u32;
 
-#[derive(Default)]
 struct Locker {
     lock: Arc<RwLock<()>>,
     clients: DashMap<LockId, Option<LockGuard>>,
+    cancel: CancellationToken,
+    timer_state_tx: watch::Sender<TimerState>,
 }
 
 enum LockGuard {
@@ -27,8 +28,65 @@ enum LockGuard {
     Write { _inner: OwnedRwLockWriteGuard<()> },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerState {
+    Stopped,
+    Counting,
+}
+
 impl Locker {
+    fn new() -> Arc<Self> {
+        let (timer_state_tx, mut timer_state_rx) = watch::channel(TimerState::Stopped);
+        let res = Arc::new(Self {
+            lock: Arc::default(),
+            clients: DashMap::new(),
+            cancel: CancellationToken::new(),
+            timer_state_tx,
+        });
+
+        let self_ = Arc::clone(&res);
+        tokio::spawn(async move {
+            let timeout = std::time::Duration::from_secs(20);
+            debug_assert!(self_.lock.try_write().is_ok());
+
+            let mut timer_cancel = CancellationToken::new();
+            loop {
+                let changed = timer_state_rx.changed().await;
+                match *timer_state_rx.borrow() {
+                    TimerState::Counting if changed.is_ok() => {
+                        let self_ = Arc::clone(&self_);
+                        let timer_cancel = timer_cancel.clone();
+                        tokio::spawn(async move {
+                            info!(
+                                "no more clients, starting an expiration timer of {:.1}s",
+                                timeout.as_secs_f32()
+                            );
+                            select! {
+                                _ = timer_cancel.cancelled() => (),
+                                _ = time::sleep(timeout) => {
+                                    debug_assert!(self_.lock.try_write().is_ok());
+                                    self_.cancel.cancel();
+                                }
+                            }
+                        });
+                    }
+                    _ => {
+                        info!("cancelling the previous timer...");
+                        timer_cancel.cancel();
+                        if changed.is_err() {
+                            break;
+                        }
+                        timer_cancel = CancellationToken::new();
+                    }
+                }
+            }
+        });
+
+        res
+    }
+
     async fn read(&self, id: LockId) {
+        self.timer_state_tx.send(TimerState::Stopped).unwrap();
         match self.clients.entry(id) {
             Entry::Vacant(e) => {
                 let guard = LockGuard::Read {
@@ -48,10 +106,11 @@ impl Locker {
                     e.insert(Some(guard));
                 }
             }
-        }
+        };
     }
 
     async fn write(&self, id: LockId) {
+        self.timer_state_tx.send(TimerState::Stopped).unwrap();
         match self.clients.entry(id) {
             Entry::Vacant(e) => {
                 let guard = LockGuard::Write {
@@ -71,11 +130,18 @@ impl Locker {
                     e.insert(Some(guard));
                 }
             }
-        }
+        };
     }
 
     fn unlock(&self, id: LockId) {
-        self.clients.remove(&id);
+        let entry = self.clients.entry(id);
+        if let Entry::Occupied(e) = entry {
+            e.remove();
+            if let Ok(guard) = self.lock.try_write() {
+                self.timer_state_tx.send(TimerState::Counting).unwrap();
+                drop(guard);
+            }
+        }
     }
 }
 
@@ -94,21 +160,10 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&localhost(port)[..]).await?;
     info!("listening on port {port}");
 
-    let token = CancellationToken::new();
-    let locker = Arc::new(Locker::default());
-
-    {
-        let token = token.clone();
-        tokio::spawn(async move {
-            // TODO: Add proper quit condition
-            time::sleep(std::time::Duration::from_secs(60)).await;
-            token.cancel();
-        });
-    }
-
+    let locker = Arc::new(Locker::new());
     loop {
         select! {
-            _ = token.cancelled() => {
+            _ = locker.cancel.cancelled() => {
                 info!("exiting...");
                 break Ok(())
             }
