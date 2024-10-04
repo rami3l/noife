@@ -12,7 +12,7 @@ use tokio::{
 };
 use tracing::info;
 
-// TODO: Figure out a better port no. scheme
+// TODO: Use Unix domain sockets instead of TCP sockets for this.
 const LOCKER_PORT: u16 = 8080;
 
 struct LockerClient {
@@ -75,11 +75,6 @@ async fn main() -> Result<ExitCode> {
     match &args[..] {
         // Rustup mode
         [head, ..] if head == "toolchain" => {
-            // if !is_root {
-            //     info!("{prefix}: releasing lock");
-            //     locker.unlock().await?;
-            // }
-
             info!("{prefix}: acquiring write lock");
             locker.write_lock().await?;
 
@@ -103,7 +98,7 @@ async fn main() -> Result<ExitCode> {
 
             info!("{prefix}: CRITICAL SECTION");
 
-            // std::thread::sleep(std::time::Duration::from_secs(60));
+            // TODO: To do this more properly, maybe make this a separate function.
             let code = if is_root {
                 resolve_cmd(head)?.args(tail).status()?
             } else {
