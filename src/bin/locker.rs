@@ -1,4 +1,4 @@
-use std::{env, sync::Arc};
+use std::{env, ptr, sync::Arc};
 
 use anyhow::{Context, Result};
 use dashmap::{DashMap, Entry};
@@ -18,7 +18,7 @@ type LockId = u32;
 
 struct Locker {
     lock: Arc<RwLock<()>>,
-    clients: DashMap<LockId, Option<LockGuard>>,
+    clients: DashMap<LockId, LockGuard>,
     cancel: CancellationToken,
     timer_state_tx: watch::Sender<TimerState>,
 }
@@ -92,18 +92,17 @@ impl Locker {
                 let guard = LockGuard::Read {
                     _inner: Arc::clone(&self.lock).read_owned().await,
                 };
-                e.insert(Some(guard));
+                e.insert(guard);
             }
             Entry::Occupied(mut e) => {
-                let taken = e
-                    .get_mut()
-                    .take_if(|it| !matches!(it, LockGuard::Read { .. }));
-                if let Some(guard) = taken {
-                    drop(guard);
-                    let guard = LockGuard::Read {
-                        _inner: Arc::clone(&self.lock).read_owned().await,
-                    };
-                    e.insert(Some(guard));
+                if let guard @ LockGuard::Write { .. } = e.get_mut() {
+                    unsafe {
+                        ptr::drop_in_place(guard);
+                        let new_guard = LockGuard::Read {
+                            _inner: Arc::clone(&self.lock).read_owned().await,
+                        };
+                        ptr::write(guard, new_guard);
+                    }
                 }
             }
         };
@@ -116,18 +115,17 @@ impl Locker {
                 let guard = LockGuard::Write {
                     _inner: Arc::clone(&self.lock).write_owned().await,
                 };
-                e.insert(Some(guard));
+                e.insert(guard);
             }
             Entry::Occupied(mut e) => {
-                let taken = e
-                    .get_mut()
-                    .take_if(|it| !matches!(it, LockGuard::Write { .. }));
-                if let Some(guard) = taken {
-                    drop(guard);
-                    let guard = LockGuard::Write {
-                        _inner: Arc::clone(&self.lock).write_owned().await,
-                    };
-                    e.insert(Some(guard));
+                if let guard @ LockGuard::Read { .. } = e.get_mut() {
+                    unsafe {
+                        ptr::drop_in_place(guard);
+                        let new_guard = LockGuard::Write {
+                            _inner: Arc::clone(&self.lock).write_owned().await,
+                        };
+                        ptr::write(guard, new_guard);
+                    }
                 }
             }
         };
