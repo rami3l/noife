@@ -16,27 +16,46 @@ use tracing::info;
 
 type LockId = u32;
 
+/// A [`Locker`] is a simple service that manages a system-wide [`RwLock`] for multiple possible
+/// rustup instances (i.e. clients), each identified with a [`LockId`].
+///
+/// For subprocesses launched by a rustup instance, they inherit the [`LockId`] from their parent
+/// process.
+///
+/// Thus, we can enforce the classical multiple concurrent reads XOR single exclusive write
+/// policy on the user's Rust installation.
 struct Locker {
+    /// The underlying [`RwLock`].
     lock: Arc<RwLock<()>>,
+    /// The collection of clients,
     clients: DashMap<LockId, LockGuard>,
+    /// The token indicating whether this locker has expired.
     cancel: CancellationToken,
-    timer_state_tx: watch::Sender<TimerState>,
+    /// The sender for this [`Locker`]'s [`TimerStateSignal`],
+    /// associated with its own expiration timer.
+    timer_state_tx: watch::Sender<TimerStateSignal>,
 }
 
+/// An owned [`RwLock`] guard that is either a read or write guard.
 enum LockGuard {
+    // HACK: `_inner` is required to avoid "dead code" warnings.
+    // I have no idea why I can't write `Read(..)` and `Write(..)` here.
     Read { _inner: OwnedRwLockReadGuard<()> },
     Write { _inner: OwnedRwLockWriteGuard<()> },
 }
 
+/// A signal indicating how the [`Locker`]'s expiration timer should behave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TimerState {
-    Stopped,
-    Counting,
+enum TimerStateSignal {
+    /// The timer should be stopped and reset.
+    Stop,
+    /// The timer should be started.
+    Start,
 }
 
 impl Locker {
     fn new() -> Arc<Self> {
-        let (timer_state_tx, mut timer_state_rx) = watch::channel(TimerState::Stopped);
+        let (timer_state_tx, mut timer_state_rx) = watch::channel(TimerStateSignal::Stop);
         let res = Arc::new(Self {
             lock: Arc::default(),
             clients: DashMap::new(),
@@ -44,6 +63,7 @@ impl Locker {
             timer_state_tx,
         });
 
+        // Start the expiration timer.
         let self_ = Arc::clone(&res);
         tokio::spawn(async move {
             let timeout = std::time::Duration::from_secs(20);
@@ -53,7 +73,7 @@ impl Locker {
             loop {
                 let changed = timer_state_rx.changed().await;
                 match *timer_state_rx.borrow() {
-                    TimerState::Counting if changed.is_ok() => {
+                    TimerStateSignal::Start if changed.is_ok() => {
                         let self_ = Arc::clone(&self_);
                         let timer_cancel = timer_cancel.clone();
                         tokio::spawn(async move {
@@ -74,6 +94,7 @@ impl Locker {
                         info!("cancelling the previous timer...");
                         timer_cancel.cancel();
                         if changed.is_err() {
+                            // The sender is gone. Stop the loop right now.
                             break;
                         }
                         timer_cancel = CancellationToken::new();
@@ -85,8 +106,14 @@ impl Locker {
         res
     }
 
+    /// Acquires a read lock from this [`Locker`].
+    /// If a lock already exists for this [`LockId`], and:
+    /// - The lock is a read lock: this will be a no-op;
+    /// - The lock is the write lock: it will be downgraded to a read lock.
+    ///
+    /// This also stops the expiration timer.
     async fn read(&self, id: LockId) {
-        self.timer_state_tx.send(TimerState::Stopped).unwrap();
+        self.timer_state_tx.send(TimerStateSignal::Stop).unwrap();
         match self.clients.entry(id) {
             Entry::Vacant(e) => {
                 let guard = LockGuard::Read {
@@ -108,8 +135,14 @@ impl Locker {
         };
     }
 
+    /// Acquires the write lock from this [`Locker`].
+    /// If a lock already exists for this [`LockId`], and:
+    /// - The lock is the write lock: this will be a no-op;
+    /// - The lock is a read lock: it will be upgrade to the write lock.
+    ///
+    /// This also stops the expiration timer.
     async fn write(&self, id: LockId) {
-        self.timer_state_tx.send(TimerState::Stopped).unwrap();
+        self.timer_state_tx.send(TimerStateSignal::Stop).unwrap();
         match self.clients.entry(id) {
             Entry::Vacant(e) => {
                 let guard = LockGuard::Write {
@@ -131,12 +164,16 @@ impl Locker {
         };
     }
 
+    /// Releases the lock associated with this [`LockId`].
+    ///
+    /// This also starts the expiration timer if there are no more clients
+    /// associated with this [`Locker`].
     fn unlock(&self, id: LockId) {
         let entry = self.clients.entry(id);
         if let Entry::Occupied(e) = entry {
             e.remove();
             if let Ok(guard) = self.lock.try_write() {
-                self.timer_state_tx.send(TimerState::Counting).unwrap();
+                self.timer_state_tx.send(TimerStateSignal::Start).unwrap();
                 drop(guard);
             }
         }
@@ -147,6 +184,10 @@ impl Locker {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    // Ensure that only one locker instance is running.
+    //
+    // TODO: This could be integrated into `Locker::try_new()`,
+    // not sure if this is a good idea though.
     let named_lock = NamedLock::create("rustup-locker")?;
     let Ok(_guard) = named_lock.try_lock() else {
         info!("another locker instance is running, exiting...");

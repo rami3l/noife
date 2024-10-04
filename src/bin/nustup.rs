@@ -54,6 +54,7 @@ async fn main() -> Result<ExitCode> {
     let _arg0 = args.next().context("no arg0 found")?;
     let args = args.collect::<Vec<_>>();
 
+    // Inherit the [`LockId`] from the root if it exists, or create it otherwise.
     let (lock_id, is_root) = if let Ok(lock_id) = env::var(RUSTUP_LOCK_ID) {
         (lock_id.parse()?, false)
     } else {
@@ -74,12 +75,19 @@ async fn main() -> Result<ExitCode> {
 
     match &args[..] {
         // Rustup mode
+        //
+        // NOTE: For the sake of this demo, we consider `nustup toolchain`
+        // the only occasion where a write lock is required.
+        // This is to simulate the behavior of e.g. `rustup toolchain install`,
+        // where the current Rust installation needs to be modified.
         [head, ..] if head == "toolchain" => {
+            // Acquire (or upgrade to) the write lock.
             info!("{prefix}: acquiring write lock");
             locker.write_lock().await?;
 
             info!("{prefix}: CRITICAL SECTION");
 
+            // Release (or downgrade from) the write lock.
             if is_root {
                 info!("{prefix}: releasing lock");
                 _ = locker.unlock().await;
@@ -89,8 +97,15 @@ async fn main() -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+
         // Proxy mode
+        //
+        // NOTE: For the sake of this demo, we consider that other `nustup foo`
+        // cases should launch a subprocess named `foo`.
+        // This is to simulate the behavior of e.g. `cargo` and `rust-analyzer`
+        // being launched via a corresponding rustup proxy.
         args @ [head, tail @ ..] => {
+            // Acquire (or inherit) the read lock.
             if is_root {
                 info!("{prefix}: acquiring read lock");
                 locker.read_lock().await?;
@@ -98,8 +113,11 @@ async fn main() -> Result<ExitCode> {
 
             info!("{prefix}: CRITICAL SECTION");
 
-            // TODO: To do this more properly, maybe make this a separate function.
+            // TODO: To do this more neatly, maybe make this a separate function.
             let code = if is_root {
+                // NOTE: We take special care for the root rustup and forbid its use of
+                // `exec*()` here even on Unix, since it is responsible for releasing
+                // the lock when the following subprocess has exited.
                 resolve_cmd(head)?.args(tail).status()?
             } else {
                 resolve_and_run_cmd(args)?
@@ -107,6 +125,7 @@ async fn main() -> Result<ExitCode> {
             .code()
             .unwrap_or(0);
 
+            // Release the read lock if it's not inherited.
             if is_root {
                 info!("{prefix}: releasing lock");
                 _ = locker.unlock().await;
