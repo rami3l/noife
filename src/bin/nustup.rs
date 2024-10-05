@@ -2,6 +2,8 @@ use std::{
     env,
     ffi::OsStr,
     process::{self, ExitCode},
+    sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
@@ -9,6 +11,7 @@ use playground_common::{localhost, resolve_and_run_cmd, resolve_cmd, RUSTUP_LOCK
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    select, signal, time,
 };
 use tracing::info;
 
@@ -50,10 +53,6 @@ impl LockerClient {
 async fn main() -> Result<ExitCode> {
     tracing_subscriber::fmt::init();
 
-    let mut args = env::args_os();
-    let _arg0 = args.next().context("no arg0 found")?;
-    let args = args.collect::<Vec<_>>();
-
     // Inherit the [`LockId`] from the root if it exists, or create it otherwise.
     let (lock_id, is_root) = if let Ok(lock_id) = env::var(RUSTUP_LOCK_ID) {
         (lock_id.parse()?, false)
@@ -61,17 +60,49 @@ async fn main() -> Result<ExitCode> {
         resolve_cmd(OsStr::new("locker"))?
             .args([LOCKER_PORT.to_string()])
             .spawn()?;
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        time::sleep(Duration::from_secs(1)).await;
         (process::id(), true)
     };
+
     env::set_var(RUSTUP_LOCK_ID, lock_id.to_string());
 
-    let prefix = format!("{} [{lock_id}]", if is_root { "root" } else { "child" });
-
-    let locker = LockerClient {
+    let locker = Arc::new(LockerClient {
         lock_id,
         port: LOCKER_PORT,
-    };
+    });
+
+    select! {
+        _ = signal::ctrl_c() => {
+            info!("received SIGINT, shutting down...");
+
+            let prefix = format!(
+                "{} [{}]",
+                if is_root { "root" } else { "child" },
+                locker.lock_id
+            );
+
+            // Release the read lock if it's not inherited.
+            if is_root {
+                info!("{prefix}: releasing lock");
+                _ = locker.unlock().await;
+            }
+
+            Ok(ExitCode::FAILURE)
+        }
+        res = run_nustup(Arc::clone(&locker), is_root) => res,
+    }
+}
+
+async fn run_nustup(locker: Arc<LockerClient>, is_root: bool) -> Result<ExitCode> {
+    let mut args = env::args_os();
+    let _arg0 = args.next().context("no arg0 found")?;
+    let args = args.collect::<Vec<_>>();
+
+    let prefix = format!(
+        "{} [{}]",
+        if is_root { "root" } else { "child" },
+        locker.lock_id
+    );
 
     match &args[..] {
         // Rustup mode
