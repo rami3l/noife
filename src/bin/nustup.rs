@@ -11,7 +11,8 @@ use playground_common::{localhost, resolve_and_run_cmd, resolve_cmd, RUSTUP_LOCK
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    select, signal, time,
+    select, signal,
+    time::{self, timeout},
 };
 use tracing::info;
 
@@ -76,10 +77,10 @@ impl LockerClient {
     async fn unwrite(&self) -> Result<()> {
         let prefix = self._prefix();
         if self.is_root {
-            info!("{prefix}: releasing lock");
+            info!("{prefix}: releasing lock on unwrite");
             _ = self.unlock_raw().await;
         } else {
-            info!("{prefix}: acquiring read lock");
+            info!("{prefix}: acquiring read lock on unwrite");
             self.read_raw().await?;
         }
         Ok(())
@@ -88,7 +89,7 @@ impl LockerClient {
     /// Releases the read lock if it's not inherited.
     async fn unread(&self) {
         if self.is_root {
-            info!("{}: releasing lock", self._prefix());
+            info!("{}: releasing lock on unread", self._prefix());
             _ = self.unlock_raw().await;
         }
     }
@@ -120,6 +121,7 @@ async fn main() -> Result<ExitCode> {
     select! {
         _ = signal::ctrl_c() => {
             info!("received SIGINT, shutting down...");
+            timeout(Duration::from_secs(5), locker.unread()).await?;
             Ok(ExitCode::FAILURE)
         }
         res = run_nustup(Arc::clone(&locker)) => res,

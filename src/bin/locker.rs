@@ -12,7 +12,7 @@ use tokio::{
     time,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 type LockId = u32;
 
@@ -219,7 +219,10 @@ async fn main() -> Result<()> {
                             b'u' => locker.unlock(id),
                             n => panic!("invalid command {:?}", n as char),
                         }
-                        socket.write_u8(n).await.expect("failed to write response");
+                        if let Err(e) = socket.write_u8(n).await {
+                            warn!("failed to write response to {id}: {e:?}");
+                            locker.unlock(id);
+                        }
                     }
                 });
             }
