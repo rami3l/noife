@@ -120,7 +120,6 @@ async fn main() -> Result<ExitCode> {
     select! {
         _ = signal::ctrl_c() => {
             info!("received SIGINT, shutting down...");
-            locker.unread().await;
             Ok(ExitCode::FAILURE)
         }
         res = run_nustup(Arc::clone(&locker)) => res,
