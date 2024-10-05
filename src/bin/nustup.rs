@@ -21,10 +21,11 @@ const LOCKER_PORT: u16 = 8080;
 struct LockerClient {
     lock_id: u32,
     port: u16,
+    is_root: bool,
 }
 
 impl LockerClient {
-    async fn read_lock(&self) -> Result<()> {
+    async fn read_raw(&self) -> Result<()> {
         let mut stream = TcpStream::connect(&localhost(self.port)[..]).await?;
         stream.write_u8(b'r').await?;
         stream.write_u32(self.lock_id).await?;
@@ -32,7 +33,7 @@ impl LockerClient {
         Ok(())
     }
 
-    async fn write_lock(&self) -> Result<()> {
+    async fn write_raw(&self) -> Result<()> {
         let mut stream = TcpStream::connect(&localhost(self.port)[..]).await?;
         stream.write_u8(b'w').await?;
         stream.write_u32(self.lock_id).await?;
@@ -40,12 +41,56 @@ impl LockerClient {
         Ok(())
     }
 
-    async fn unlock(&self) -> Result<()> {
+    async fn unlock_raw(&self) -> Result<()> {
         let mut stream = TcpStream::connect(&localhost(self.port)[..]).await?;
         stream.write_u8(b'u').await?;
         stream.write_u32(self.lock_id).await?;
         stream.read_u8().await?;
         Ok(())
+    }
+
+    fn _prefix(&self) -> String {
+        format!(
+            "{} [{}]",
+            if self.is_root { "root" } else { "child" },
+            self.lock_id
+        )
+    }
+
+    // Acquires (or inherits) a read lock.
+    async fn read(&self) -> Result<()> {
+        if self.is_root {
+            info!("{}: acquiring read lock", self._prefix());
+            self.read_raw().await?;
+        }
+        Ok(())
+    }
+
+    // Acquires (or upgrades to) the write lock.
+    async fn write(&self) -> Result<()> {
+        info!("{}: acquiring write lock", self._prefix());
+        self.write_raw().await
+    }
+
+    /// Releases (or downgrades from) the write lock.
+    async fn unwrite(&self) -> Result<()> {
+        let prefix = self._prefix();
+        if self.is_root {
+            info!("{prefix}: releasing lock");
+            _ = self.unlock_raw().await;
+        } else {
+            info!("{prefix}: acquiring read lock");
+            self.read_raw().await?;
+        }
+        Ok(())
+    }
+
+    /// Releases the read lock if it's not inherited.
+    async fn unread(&self) {
+        if self.is_root {
+            info!("{}: releasing lock", self._prefix());
+            _ = self.unlock_raw().await;
+        }
     }
 }
 
@@ -69,40 +114,25 @@ async fn main() -> Result<ExitCode> {
     let locker = Arc::new(LockerClient {
         lock_id,
         port: LOCKER_PORT,
+        is_root,
     });
 
     select! {
         _ = signal::ctrl_c() => {
             info!("received SIGINT, shutting down...");
-
-            let prefix = format!(
-                "{} [{}]",
-                if is_root { "root" } else { "child" },
-                locker.lock_id
-            );
-
-            // Release the read lock if it's not inherited.
-            if is_root {
-                info!("{prefix}: releasing lock");
-                _ = locker.unlock().await;
-            }
-
+            locker.unread().await;
             Ok(ExitCode::FAILURE)
         }
-        res = run_nustup(Arc::clone(&locker), is_root) => res,
+        res = run_nustup(Arc::clone(&locker)) => res,
     }
 }
 
-async fn run_nustup(locker: Arc<LockerClient>, is_root: bool) -> Result<ExitCode> {
+async fn run_nustup(locker: Arc<LockerClient>) -> Result<ExitCode> {
     let mut args = env::args_os();
     let _arg0 = args.next().context("no arg0 found")?;
     let args = args.collect::<Vec<_>>();
 
-    let prefix = format!(
-        "{} [{}]",
-        if is_root { "root" } else { "child" },
-        locker.lock_id
-    );
+    let prefix = locker._prefix();
 
     match &args[..] {
         // Rustup mode
@@ -112,20 +142,11 @@ async fn run_nustup(locker: Arc<LockerClient>, is_root: bool) -> Result<ExitCode
         // This is to simulate the behavior of e.g. `rustup toolchain install`,
         // where the current Rust installation needs to be modified.
         [head, ..] if head == "toolchain" => {
-            // Acquire (or upgrade to) the write lock.
-            info!("{prefix}: acquiring write lock");
-            locker.write_lock().await?;
+            locker.write().await?;
 
             info!("{prefix}: CRITICAL SECTION");
 
-            // Release (or downgrade from) the write lock.
-            if is_root {
-                info!("{prefix}: releasing lock");
-                _ = locker.unlock().await;
-            } else {
-                info!("{prefix}: acquiring read lock");
-                locker.read_lock().await?;
-            }
+            locker.unwrite().await?;
             Ok(ExitCode::SUCCESS)
         }
 
@@ -136,16 +157,12 @@ async fn run_nustup(locker: Arc<LockerClient>, is_root: bool) -> Result<ExitCode
         // This is to simulate the behavior of e.g. `cargo` and `rust-analyzer`
         // being launched via a corresponding rustup proxy.
         args @ [head, tail @ ..] => {
-            // Acquire (or inherit) the read lock.
-            if is_root {
-                info!("{prefix}: acquiring read lock");
-                locker.read_lock().await?;
-            }
+            locker.read().await?;
 
             info!("{prefix}: CRITICAL SECTION");
 
             // TODO: To do this more neatly, maybe make this a separate function.
-            let code = if is_root {
+            let code = if locker.is_root {
                 // NOTE: We take special care for the root rustup and forbid its use of
                 // `exec*()` here even on Unix, since it is responsible for releasing
                 // the lock when the following subprocess has exited.
@@ -156,11 +173,7 @@ async fn run_nustup(locker: Arc<LockerClient>, is_root: bool) -> Result<ExitCode
             .code()
             .unwrap_or(0);
 
-            // Release the read lock if it's not inherited.
-            if is_root {
-                info!("{prefix}: releasing lock");
-                _ = locker.unlock().await;
-            }
+            locker.unread().await;
             Ok(ExitCode::from(code as u8))
         }
 
