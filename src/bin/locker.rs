@@ -216,7 +216,7 @@ async fn main() -> Result<()> {
                         match n {
                             b'r' => locker.read(id).await,
                             b'w' => locker.write(id).await,
-                            b'u' => locker.unlock(id),
+                            // b'u' => locker.unlock(id),
                             n => panic!("invalid command {:?}", n as char),
                         }
                         socket.write_u8(n).await.expect("failed to write response");

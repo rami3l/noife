@@ -36,14 +36,6 @@ impl LockerClient {
         stream.read_u8().await?;
         Ok(())
     }
-
-    async fn unlock(&self) -> Result<()> {
-        let mut stream = TcpStream::connect(&localhost(self.port)[..]).await?;
-        stream.write_u8(b'u').await?;
-        stream.write_u32(self.lock_id).await?;
-        stream.read_u8().await?;
-        Ok(())
-    }
 }
 
 #[tokio::main]
@@ -88,10 +80,7 @@ async fn main() -> Result<ExitCode> {
             info!("{prefix}: CRITICAL SECTION");
 
             // Release (or downgrade from) the write lock.
-            if is_root {
-                info!("{prefix}: releasing lock");
-                _ = locker.unlock().await;
-            } else {
+            if !is_root {
                 info!("{prefix}: acquiring read lock");
                 locker.read_lock().await?;
             }
@@ -125,11 +114,6 @@ async fn main() -> Result<ExitCode> {
             .code()
             .unwrap_or(0);
 
-            // Release the read lock if it's not inherited.
-            if is_root {
-                info!("{prefix}: releasing lock");
-                _ = locker.unlock().await;
-            }
             Ok(ExitCode::from(code as u8))
         }
 
