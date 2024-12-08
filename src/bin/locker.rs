@@ -4,11 +4,12 @@ use anyhow::{Context, Result};
 use dashmap::{DashMap, Entry};
 use named_lock::NamedLock;
 use playground_common::localhost;
+use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     select,
-    sync::{watch, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock},
+    sync::{watch, Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock},
     time,
 };
 use tokio_util::sync::CancellationToken;
@@ -27,13 +28,19 @@ type LockId = u32;
 struct Locker {
     /// The underlying [`RwLock`].
     lock: Arc<RwLock<()>>,
+
     /// The collection of clients,
     clients: DashMap<LockId, LockGuard>,
+
     /// The token indicating whether this locker has expired.
     cancel: CancellationToken,
+
     /// The sender for this [`Locker`]'s [`TimerStateSignal`],
     /// associated with its own expiration timer.
     timer_state_tx: watch::Sender<TimerStateSignal>,
+
+    /// The [`sysinfo`] source.
+    system: Mutex<System>,
 }
 
 /// An owned [`RwLock`] guard that is either a read or write guard.
@@ -55,55 +62,87 @@ enum TimerStateSignal {
 
 impl Locker {
     fn new() -> Arc<Self> {
-        let (timer_state_tx, mut timer_state_rx) = watch::channel(TimerStateSignal::Stop);
+        let (timer_state_tx, timer_state_rx) = watch::channel(TimerStateSignal::Stop);
         let res = Arc::new(Self {
             lock: Arc::default(),
             clients: DashMap::new(),
             cancel: CancellationToken::new(),
             timer_state_tx,
+            system: Mutex::new(System::new_with_specifics(
+                RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
+            )),
         });
 
-        // Start the expiration timer.
         let self_ = Arc::clone(&res);
-        tokio::spawn(async move {
-            let timeout = std::time::Duration::from_secs(20);
-            debug_assert!(self_.lock.try_write().is_ok());
+        tokio::spawn(async move { self_.expiration_timer(timer_state_rx).await });
 
-            let mut timer_cancel = CancellationToken::new();
-            loop {
-                let changed = timer_state_rx.changed().await;
-                match *timer_state_rx.borrow() {
-                    TimerStateSignal::Start if changed.is_ok() => {
-                        let self_ = Arc::clone(&self_);
-                        let timer_cancel = timer_cancel.clone();
-                        tokio::spawn(async move {
-                            info!(
-                                "no more clients, starting an expiration timer of {:.1}s",
-                                timeout.as_secs_f32()
-                            );
-                            select! {
-                                _ = timer_cancel.cancelled() => (),
-                                _ = time::sleep(timeout) => {
-                                    debug_assert!(self_.lock.try_write().is_ok());
-                                    self_.cancel.cancel();
-                                }
-                            }
-                        });
-                    }
-                    _ => {
-                        info!("cancelling the previous timer...");
-                        timer_cancel.cancel();
-                        if changed.is_err() {
-                            // The sender is gone. Stop the loop right now.
-                            break;
-                        }
-                        timer_cancel = CancellationToken::new();
-                    }
-                }
-            }
-        });
+        let self_ = Arc::clone(&res);
+        tokio::spawn(async move { self_.watch_procs().await });
 
         res
+    }
+
+    async fn expiration_timer(
+        self: Arc<Self>,
+        mut timer_state_rx: watch::Receiver<TimerStateSignal>,
+    ) {
+        let timeout = time::Duration::from_secs(20);
+        debug_assert!(self.lock.try_write().is_ok());
+
+        let mut timer_cancel = CancellationToken::new();
+        loop {
+            let changed = timer_state_rx.changed().await;
+            match *timer_state_rx.borrow() {
+                TimerStateSignal::Start if changed.is_ok() => {
+                    let self_ = Arc::clone(&self);
+                    let timer_cancel = timer_cancel.clone();
+                    tokio::spawn(async move {
+                        info!(
+                            "no more clients, starting an expiration timer of {:.1}s",
+                            timeout.as_secs_f32()
+                        );
+                        select! {
+                            _ = timer_cancel.cancelled() => (),
+                            _ = time::sleep(timeout) => {
+                                debug_assert!(self_.lock.try_write().is_ok());
+                                self_.cancel.cancel();
+                            }
+                        }
+                    });
+                }
+                _ => {
+                    info!("cancelling the previous timer...");
+                    timer_cancel.cancel();
+                    if changed.is_err() {
+                        // The sender is gone. Stop the loop right now.
+                        break;
+                    }
+                    timer_cancel = CancellationToken::new();
+                }
+            }
+        }
+    }
+
+    /// Watches the (root) client processes associated with this [`Locker`],
+    /// and releases the lock if the process has exited.
+    ///
+    /// This also starts the expiration timer if there are no more clients
+    /// associated with this [`Locker`].
+    async fn watch_procs(self: Arc<Self>) {
+        let mut ticker = time::interval(time::Duration::from_secs(1)); // TODO: What's the best value?
+        loop {
+            ticker.tick().await;
+            let mut system = self.system.lock().await;
+            system.refresh_all();
+
+            self.clients
+                .retain(|&id, _| system.process((id as usize).into()).is_some());
+
+            if let Ok(guard) = self.lock.try_write() {
+                self.timer_state_tx.send(TimerStateSignal::Start).unwrap();
+                drop(guard);
+            }
+        }
     }
 
     /// Acquires a read lock from this [`Locker`].
@@ -162,21 +201,6 @@ impl Locker {
                 }
             }
         };
-    }
-
-    /// Releases the lock associated with this [`LockId`].
-    ///
-    /// This also starts the expiration timer if there are no more clients
-    /// associated with this [`Locker`].
-    fn unlock(&self, id: LockId) {
-        let entry = self.clients.entry(id);
-        if let Entry::Occupied(e) = entry {
-            e.remove();
-            if let Ok(guard) = self.lock.try_write() {
-                self.timer_state_tx.send(TimerStateSignal::Start).unwrap();
-                drop(guard);
-            }
-        }
     }
 }
 
